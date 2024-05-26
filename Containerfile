@@ -5,7 +5,9 @@ WORKDIR /work
 
 RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod go build -v -o nimby ./cmd
 
-FROM scratch
+# FROM scratch
+FROM docker.io/library/alpine
+
 LABEL org.opencontainers.image.description "A really simple ingress proxy service for https://developer.hashicorp.com/nomad jobs"
 LABEL org.opencontainers.image.authors "John Manero<john@manero.io>"
 

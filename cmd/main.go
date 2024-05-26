@@ -33,7 +33,7 @@ func main() {
 		Addr:    nimby.EnvString("NIMBY_ADDR", "0.0.0.0:9876"),
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 			// Inject an annotated logger into request contexts
-			ctx, logger = logging.WithLogger(ctx, logger, zap.Stringer("peer.addr", conn.RemoteAddr()))
+			ctx, logger := logging.WithLogger(ctx, logger, zap.Stringer("peer.addr", conn.RemoteAddr()))
 			logger.Info("http.connection")
 
 			return ctx

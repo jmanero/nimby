@@ -104,6 +104,7 @@ func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
 // Run consumes Service events from the Nomad API to update the controller's backend mappings
 func (controller *Controller) Run(ctx context.Context, services []string) (err error) {
 	logger := logging.Logger(ctx)
+	logger.Info("controller.start")
 
 	client, err := api.NewClient(api.DefaultConfig())
 	if err != nil {
@@ -116,6 +117,10 @@ func (controller *Controller) Run(ctx context.Context, services []string) (err e
 	events, err := client.EventStream().Stream(ctx, map[api.Topic][]string{
 		api.TopicService: services,
 	}, 0, &api.QueryOptions{})
+
+	if err != nil {
+		return
+	}
 
 	// Stream() will close the events channel when the calling context is canceled
 	for evs := range events {
@@ -137,5 +142,6 @@ func (controller *Controller) Run(ctx context.Context, services []string) (err e
 		}
 	}
 
+	logger.Info("controller.stop", zap.Error(err))
 	return
 }
