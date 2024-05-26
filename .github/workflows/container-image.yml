@@ -1,0 +1,44 @@
+---
+name: Build and Push Container Image
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '*.md' # Don't trigger builds for documentation changes
+  workflow_dispatch:
+    inputs: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and Push Container Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build-image
+        run: |
+          TIMESTAMP=$(date --utc +%Y-%m-%dT%H%M%S)
+
+          docker build --pull --file Containerfile \
+            --label "org.opencontainers.image.authors=john@manero.io" \
+            --label "org.opencontainers.image.url=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}/commit/${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$TIMESTAMP" \
+            --tag ghcr.io/${{ github.repository }}:latest .
+
+          docker tag ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}:$TIMESTAMP
+          docker push ghcr.io/${{ github.repository }}:$TIMESTAMP
+          docker push ghcr.io/${{ github.repository }}:latest
