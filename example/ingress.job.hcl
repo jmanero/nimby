@@ -22,10 +22,7 @@ job "ingress" {
       driver = "docker"
 
       identity {
-        ## Provide a NOMAD_TOKEN environment variable for use with the
-        ## /secrets/api.sock listener
-        env = true
-
+        file = true
         change_mode = "signal"
         change_signal = "SIGHUP"
       }
@@ -35,7 +32,7 @@ job "ingress" {
         ports = ["http"]
 
         security_opt = [
-          ## Connection to a unix socket appears to be omitted in policy from container-selinux-2.230.0
+          ## Policy to permit connection to a unix socket appears to be omitted in policy from container-selinux-2.230.0
           ## avc:  denied  { connectto } ... comm="curl" path="/var/data/nomad/alloc/.../secrets/api.sock" scontext=system_u:system_r:container_t:s0:... tcontext=system_u:system_r:unconfined_service_t:s0 tclass=unix_stream_socket permissive=0
           "label=disable"
         ]

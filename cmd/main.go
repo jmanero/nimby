@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,7 +25,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	controller := nimby.New()
+	controller, err := nimby.New(nimby.Options{
+		WatchServices: nimby.EnvStrings("NIMBY_SERVICES", ",", []string{"*"}),
+
+		TokenPath:   nimby.EnvString("NOMAD_TOKEN_PATH", "/secrets/nomad_token"),
+		TokenReload: []os.Signal{syscall.SIGINT},
+	})
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Unable to create controller", err)
+		os.Exit(1)
+	}
 
 	server := http.Server{
 		Handler: controller,
@@ -44,8 +53,9 @@ func main() {
 
 	group, ctx := errgroup.WithContext(ctx)
 
-	group.Go(func() error { return server.ListenAndServe() })
-	group.Go(func() error { return controller.Run(ctx, nimby.EnvStrings("NIMBY_SERVICES", ",", []string{"*"})) })
+	group.Go(func() error { return nimby.NotError(server.ListenAndServe(), http.ErrServerClosed) })
+	group.Go(func() error { return controller.TokenReloader(ctx) })
+	group.Go(func() error { return controller.Updater(ctx) })
 
 	<-ctx.Done()
 
@@ -53,7 +63,7 @@ func main() {
 		logger.Error("http.shutdown", zap.Error(err))
 	}
 
-	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+	if err := group.Wait(); err != nil {
 		logger.Error("service", zap.Error(err))
 		os.Exit(1)
 	}

@@ -3,6 +3,9 @@ package nimby
 import (
 	"context"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/nomad/api"
@@ -18,17 +21,34 @@ type Handler interface {
 	Empty() bool
 }
 
+// Options for the controller's event watcher
+type Options struct {
+	WatchServices []string
+
+	TokenPath   string
+	TokenReload []os.Signal
+}
+
 // Controller uses a Nomad event stream to update ingress mappings
 type Controller struct {
+	Options
 	sync.Map
 
+	*api.Client
 	notEmpty
+
 	mu sync.Mutex
 }
 
 // New initializes a Controller
-func New() *Controller {
-	return &Controller{}
+func New(opts Options) (*Controller, error) {
+	client, err := api.NewClient(api.DefaultConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	controller := &Controller{Options: opts, Client: client}
+	return controller, controller.LoadToken()
 }
 
 func (controller *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,14 +74,14 @@ func (controller *Controller) Get(domain string) (balancer Handler, has bool) {
 // Add inserts a new service instance to the controller, creating a Balancer
 // instance for the service if one does not already exist
 func (controller *Controller) Add(service *api.ServiceRegistration) Handler {
-	controller.mu.Lock()
-	defer controller.mu.Unlock()
-
 	domain, has := DomainTag(service.Tags)
 	if !has {
 		// WARN: Service does not have a nimby-domain tag
 		return controller
 	}
+
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
 
 	balancer, has := controller.Get(domain)
 	if !has {
@@ -75,14 +95,14 @@ func (controller *Controller) Add(service *api.ServiceRegistration) Handler {
 
 // Del removes a service instance from the controller, removing an empty Balancer
 func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
-	controller.mu.Lock()
-	defer controller.mu.Unlock()
-
 	domain, has := DomainTag(service.Tags)
 	if !has {
 		// WARN: Service does not have a nimby-domain tag
 		return controller
 	}
+
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
 
 	balancer, has := controller.Get(domain)
 	if !has {
@@ -101,22 +121,75 @@ func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
 	return controller
 }
 
-// Run consumes Service events from the Nomad API to update the controller's backend mappings
-func (controller *Controller) Run(ctx context.Context, services []string) (err error) {
+// LoadToken reads and sets the controller's Nomad API token from TokenPath
+func (controller *Controller) LoadToken() error {
+	token, err := os.ReadFile(controller.TokenPath)
+	if err != nil {
+		return err
+	}
+
+	controller.SetSecretID(strings.TrimSpace(string(token)))
+	return nil
+}
+
+// TokenReloader watches for OS signals to re-read the nomad auth-token from a file
+func (controller *Controller) TokenReloader(ctx context.Context) (err error) {
+	reload := make(chan os.Signal, 1)
+
+	signal.Notify(reload, controller.TokenReload...)
+	defer signal.Stop(reload)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-reload:
+			err = controller.LoadToken()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+// Updater consumes Service events from the Nomad API to update the controller's backend mappings
+func (controller *Controller) Updater(ctx context.Context) (err error) {
 	logger := logging.Logger(ctx)
 	logger.Info("controller.start")
 
-	client, err := api.NewClient(api.DefaultConfig())
-	if err != nil {
-		return
+	// Get the current snapshot of services, and the last modify-index for the events stream
+	services := controller.WatchServices
+	if len(services) == 1 && services[0] == "*" {
+		list, _, err := controller.Services().List(nil)
+		if err != nil {
+			return err
+		}
+
+		for _, svc := range list[0].Services {
+			services = append(services, svc.ServiceName)
+		}
 	}
 
-	// Get the current snapshot of services, and the
-	// client.Services().List(&api.QueryOptions{})
+	var index uint64
+	for _, service := range services {
+		logger.Info("controller.init", zap.String("service", service))
+		entries, meta, err := controller.Services().Get(service, nil)
+		if err != nil {
+			return err
+		}
 
-	events, err := client.EventStream().Stream(ctx, map[api.Topic][]string{
-		api.TopicService: services,
-	}, 0, &api.QueryOptions{})
+		if meta.LastIndex > index {
+			index = meta.LastIndex
+		}
+
+		for _, svc := range entries {
+			controller.Add(svc)
+		}
+	}
+
+	logger.Info("controller.run")
+	events, err := controller.EventStream().Stream(ctx,
+		map[api.Topic][]string{api.TopicService: controller.WatchServices}, index, nil)
 
 	if err != nil {
 		return

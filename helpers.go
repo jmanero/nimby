@@ -2,6 +2,7 @@ package nimby
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -114,4 +115,13 @@ func Shutdown(server *http.Server, timeout time.Duration) error {
 
 	defer done()
 	return server.Shutdown(ctx)
+}
+
+// NotError is a helper to squash an "expected" error, e.g. context.Canceled or http.ErrServerClosed
+func NotError(err, target error) error {
+	if errors.Is(err, target) {
+		return nil
+	}
+
+	return err
 }
