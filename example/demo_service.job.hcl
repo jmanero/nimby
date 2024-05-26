@@ -8,7 +8,7 @@ job "demo_service" {
     network {
       mode = "bridge"
       port "http" {
-        to 80
+        to = 80
       }
     }
 

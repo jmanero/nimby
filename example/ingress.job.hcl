@@ -6,8 +6,8 @@ job "ingress" {
     network {
       mode = "bridge"
       port "http" {
-        static 80
-        to 9876
+        static = 80
+        to     = 9876
       }
     }
 
