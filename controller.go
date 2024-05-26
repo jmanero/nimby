@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/jmanero/nimby/logging"
+	"go.uber.org/zap"
 )
 
 // Handler implements a dynamic HTTP request router
@@ -101,6 +103,8 @@ func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
 
 // Run consumes Service events from the Nomad API to update the controller's backend mappings
 func (controller *Controller) Run(ctx context.Context, services []string) (err error) {
+	logger := logging.Logger(ctx)
+
 	client, err := api.NewClient(api.DefaultConfig())
 	if err != nil {
 		return
@@ -110,15 +114,17 @@ func (controller *Controller) Run(ctx context.Context, services []string) (err e
 	// client.Services().List(&api.QueryOptions{})
 
 	events, err := client.EventStream().Stream(ctx, map[api.Topic][]string{
-		api.TopicService: services, // TODO: Configurable service filter
+		api.TopicService: services,
 	}, 0, &api.QueryOptions{})
 
 	// Stream() will close the events channel when the calling context is canceled
 	for evs := range events {
 		for _, ev := range evs.Events {
+			logger.Info("controller.event", zap.String("event.type", ev.Type), zap.Uint64("event.index", ev.Index))
+
 			sv, err := ev.Service()
 			if err != nil {
-				// WARN: Event decoding error
+				logger.Warn("controller.error", zap.Error(err))
 				continue
 			}
 
