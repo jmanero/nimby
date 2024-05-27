@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 
@@ -16,8 +17,8 @@ import (
 // Handler implements a dynamic HTTP request router
 type Handler interface {
 	http.Handler
-	Add(*api.ServiceRegistration) Handler
-	Del(*api.ServiceRegistration) Handler
+	Add(context.Context, *api.ServiceRegistration) Handler
+	Del(context.Context, *api.ServiceRegistration) Handler
 	Empty() bool
 }
 
@@ -73,33 +74,43 @@ func (controller *Controller) Get(domain string) (balancer Handler, has bool) {
 
 // Add inserts a new service instance to the controller, creating a Balancer
 // instance for the service if one does not already exist
-func (controller *Controller) Add(service *api.ServiceRegistration) Handler {
+func (controller *Controller) Add(ctx context.Context, service *api.ServiceRegistration) Handler {
+
 	domain, has := DomainTag(service.Tags)
 	if !has {
-		// WARN: Service does not have a nimby-domain tag
 		return controller
 	}
+
+	ctx, logger := logging.Logger(ctx,
+		zap.String("domain", domain),
+		zap.String("service", service.ServiceName),
+		zap.String("ns", service.Namespace))
 
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
 
 	balancer, has := controller.Get(domain)
 	if !has {
-		// Create a balancer for a new service domain
+		logger.Info("service.add")
 		balancer = NewBalancer(service.Tags)
 	}
 
-	controller.Store(domain, balancer.Add(service))
+	controller.Store(domain, balancer.Add(ctx, service))
 	return controller
 }
 
 // Del removes a service instance from the controller, removing an empty Balancer
-func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
+func (controller *Controller) Del(ctx context.Context, service *api.ServiceRegistration) Handler {
+
 	domain, has := DomainTag(service.Tags)
 	if !has {
-		// WARN: Service does not have a nimby-domain tag
 		return controller
 	}
+
+	ctx, logger := logging.Logger(ctx,
+		zap.String("domain", domain),
+		zap.String("service", service.ServiceName),
+		zap.String("ns", service.Namespace))
 
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
@@ -109,10 +120,11 @@ func (controller *Controller) Del(service *api.ServiceRegistration) Handler {
 		return controller
 	}
 
-	balancer = balancer.Del(service)
+	balancer = balancer.Del(ctx, service)
 
 	if balancer.Empty() {
 		// Remove the domain for an empty Balancer from the controller
+		logger.Info("service.remove")
 		controller.Delete(domain)
 	} else {
 		controller.Store(domain, balancer)
@@ -134,7 +146,11 @@ func (controller *Controller) LoadToken() error {
 
 // TokenReloader watches for OS signals to re-read the nomad auth-token from a file
 func (controller *Controller) TokenReloader(ctx context.Context) (err error) {
+	ctx, logger := logging.Logger(ctx, zap.String("routine", "token"))
+	logger.Info("token.started")
+
 	reload := make(chan os.Signal, 1)
+	defer close(reload)
 
 	signal.Notify(reload, controller.TokenReload...)
 	defer signal.Stop(reload)
@@ -142,11 +158,15 @@ func (controller *Controller) TokenReloader(ctx context.Context) (err error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-reload:
+			logger.Info("token.stopped")
+			return
+
+		case sig := <-reload:
+			logger.Info("token.reloading", zap.Stringer("signal", sig), zap.String("path", controller.TokenPath))
+
 			err = controller.LoadToken()
 			if err != nil {
-				return
+				logger.Error("token.error", zap.Error(err))
 			}
 		}
 	}
@@ -154,67 +174,84 @@ func (controller *Controller) TokenReloader(ctx context.Context) (err error) {
 
 // Updater consumes Service events from the Nomad API to update the controller's backend mappings
 func (controller *Controller) Updater(ctx context.Context) (err error) {
-	logger := logging.Logger(ctx)
-	logger.Info("controller.start")
+	ctx, logger := logging.Logger(ctx, zap.String("routine", "updater"))
+	logger.Info("updater.starting", zap.Strings("services", controller.WatchServices))
 
-	// Get the current snapshot of services, and the last modify-index for the events stream
+	// If WatchServices is '*', collect a list of existing services
 	services := controller.WatchServices
-	if len(services) == 1 && services[0] == "*" {
+	if slices.Contains(services, "*") {
+		services = services[:0]
+
 		list, _, err := controller.Services().List(nil)
 		if err != nil {
 			return err
 		}
 
+		// TODO: Handle '*' namespace... Currently assume that NOMAD_NAMESPACE is not '*'
 		for _, svc := range list[0].Services {
 			services = append(services, svc.ServiceName)
 		}
 	}
 
+	// List existing members of each service and collect the update index to start watching events
 	var index uint64
 	for _, service := range services {
-		logger.Info("controller.init", zap.String("service", service))
 		entries, meta, err := controller.Services().Get(service, nil)
 		if err != nil {
 			return err
 		}
 
+		logger.Info("updater.sync", zap.String("service", service), zap.Uint64("index", meta.LastIndex))
 		if meta.LastIndex > index {
-			index = meta.LastIndex
+			index = meta.LastIndex + 1
 		}
 
 		for _, svc := range entries {
-			controller.Add(svc)
+			controller.Add(ctx, svc)
 		}
 	}
 
-	logger.Info("controller.run")
-	events, err := controller.EventStream().Stream(ctx,
-		map[api.Topic][]string{api.TopicService: controller.WatchServices}, index, nil)
+	for {
+		// Check for context cancellation before making new events request
+		select {
+		case <-ctx.Done():
+			logger.Info("updater.stopped")
+			return
+		default:
+		}
 
-	if err != nil {
-		return
-	}
+		logger.Info("updater.streaming", zap.Uint64("index", index))
+		events, err := controller.EventStream().Stream(ctx,
+			map[api.Topic][]string{api.TopicService: controller.WatchServices}, index, nil)
 
-	// Stream() will close the events channel when the calling context is canceled
-	for evs := range events {
-		for _, ev := range evs.Events {
-			logger.Info("controller.event", zap.String("event.type", ev.Type), zap.Uint64("event.index", ev.Index))
+		if err != nil {
+			logger.Error("updater.error", zap.Error(err))
+			return err
+		}
 
-			sv, err := ev.Service()
-			if err != nil {
-				logger.Warn("controller.error", zap.Error(err))
-				continue
-			}
+		// Stream() will close the events channel when the calling context is canceled
+		for evs := range events {
+			for _, ev := range evs.Events {
+				logger.Info("updaterevent", zap.String("type", ev.Type), zap.Uint64("index", ev.Index))
+				index = ev.Index
 
-			switch ev.Type {
-			case "ServiceRegistration":
-				controller.Add(sv)
-			case "ServiceDeregistration":
-				controller.Del(sv)
+				sv, err := ev.Service()
+				if err != nil {
+					logger.Warn("updater.error", zap.Error(err))
+					continue
+				}
+
+				if sv == nil {
+					continue
+				}
+
+				switch ev.Type {
+				case "ServiceRegistration":
+					controller.Add(ctx, sv)
+				case "ServiceDeregistration":
+					controller.Del(ctx, sv)
+				}
 			}
 		}
 	}
-
-	logger.Info("controller.stop", zap.Error(err))
-	return
 }
