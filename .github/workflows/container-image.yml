@@ -35,7 +35,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: build-image
+      - name: Build and Push linux/arm64 and linux/arm64 Images to GHCR
         run: |
           TIMESTAMP=$(date --utc +%Y-%m-%dT%H%M%S)
 
@@ -43,4 +43,5 @@ jobs:
             --label "org.opencontainers.image.url=https://github.com/${{ github.repository }}" \
             --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}/commit/${{ github.sha }}" \
             --label "org.opencontainers.image.created=$TIMESTAMP" \
-            --tag ghcr.io/${{ github.repository }}:latest --tag ghcr.io/${{ github.repository }}:$TIMESTAMP --push .
+            --tag ghcr.io/${{ github.repository }}:latest \
+            --tag ghcr.io/${{ github.repository }}:$TIMESTAMP --push .

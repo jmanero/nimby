@@ -1,36 +1,45 @@
 package nimby
 
 import (
+	"context"
 	"crypto/rand"
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/hashicorp/nomad/api"
+	"github.com/jmanero/nimby/logging"
+	"go.uber.org/zap"
 )
 
-// WeightedBackend provides an HTTP upstream for weighted balancer implementations
-type WeightedBackend struct {
+// WeightedUpstream provides an HTTP upstream for weighted balancer implementations
+type WeightedUpstream struct {
 	ID      string
 	JobID   string
 	AllocID string
 
 	Weight   uint64
-	Upstream url.URL
+	Endpoint url.URL
 }
 
-func (backend WeightedBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var request http.Request
+func (backend WeightedUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, logger := logging.Logger(r.Context())
 
-	request = *r
-	request.URL = &backend.Upstream
-	// TODO: Forwarding headers
+	r.RequestURI = ""
+	r.URL = backend.Endpoint.JoinPath(r.URL.RawPath)
+	// TODO: Forwarding address headers
 
-	res, err := http.DefaultClient.Do(&request)
+	start := time.Now()
+	logger.Info("upstream.begin", zap.Time("start", start), zap.String("method", r.Method), zap.Stringer("endpoint", r.URL))
+
+	res, err := http.DefaultClient.Do(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	logger.Info("upstream.response", zap.Time("start", start), zap.Duration("elapsed", time.Since(start)), zap.Int("code", res.StatusCode))
 
 	headers := w.Header()
 	for name, values := range res.Header {
@@ -41,18 +50,20 @@ func (backend WeightedBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	io.Copy(w, res.Body)
 	res.Body.Close()
 
-	headers = w.Header()
+	// Best effort to propagate trailers downstream... Not tested yet.
 	for name, values := range res.Trailer {
-		headers[name] = values
+		headers[http.TrailerPrefix+name] = values
 	}
+
+	logger.Info("upstream.end", zap.Time("start", start), zap.Duration("elapsed", time.Since(start)))
 }
 
 // WeightedRandom implements a simple load-balancer Handler
 type WeightedRandom struct {
-	Backends map[string]*WeightedBackend
-	Total    uint64
+	Upstreams map[string]*WeightedUpstream
+	Total     uint64
 
-	weighted []*WeightedBackend
+	weighted []*WeightedUpstream
 	random   io.Reader
 
 	notEmpty
@@ -65,18 +76,25 @@ func NewBalancer(_ []string) Handler {
 }
 
 func (balancer WeightedRandom) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	random, err := balancer.Uint64n()
+	upstream, err := balancer.Next()
 	if err != nil {
-		// TODO: Log error
+		logging.Warn(r.Context(), "balancer.error", zap.Error(err))
 		http.Error(w, "Unhandled Error", http.StatusInternalServerError)
 		return
 	}
 
-	balancer.weighted[random].ServeHTTP(w, r)
+	ctx, logger := logging.Logger(r.Context(),
+		zap.String("upstream", upstream.ID),
+		zap.Uint64("weight", upstream.Weight),
+		zap.Stringer("endpoint", &upstream.Endpoint))
+
+	logger.Info("request.begin")
+	upstream.ServeHTTP(w, r.Clone(ctx))
+	logger.Info("request.end")
 }
 
-// Uint64n generates a random uint64 in the half-range of [0:Total]
-func (balancer WeightedRandom) Uint64n() (val uint64, err error) {
+// Next selects an upstream to use for a request
+func (balancer WeightedRandom) Next() (upstream *WeightedUpstream, err error) {
 	var buf [8]byte
 
 	_, err = balancer.random.Read(buf[:])
@@ -84,7 +102,7 @@ func (balancer WeightedRandom) Uint64n() (val uint64, err error) {
 		return
 	}
 
-	val += uint64(buf[7])
+	val := uint64(buf[7])
 	val += uint64(buf[6]) << 8
 	val += uint64(buf[5]) << 16
 	val += uint64(buf[4]) << 24
@@ -93,67 +111,96 @@ func (balancer WeightedRandom) Uint64n() (val uint64, err error) {
 	val += uint64(buf[1]) << 48
 	val += uint64(buf[0]) << 56
 
-	return val % balancer.Total, nil
+	val = val % balancer.Total
+	return balancer.weighted[val], nil
 }
 
-// Add inserts a backend and rehashes the balancer's internal weighting
-func (balancer WeightedRandom) Add(service *api.ServiceRegistration) Handler {
-	weight, _ := WeightTag(service.Tags)
-	balancer.Total += uint64(weight)
+// Rehash rebuilds the balancer's weighted lookup table
+func (balancer *WeightedRandom) Rehash(ctx context.Context) {
+	weighted := make([]*WeightedUpstream, 0, balancer.Total)
 
-	// Rebuild the balancer's map and distribution slice
-	backends := make(map[string]*WeightedBackend, len(balancer.Backends)+1)
-	weighted := make([]*WeightedBackend, 0, balancer.Total)
-
-	// Add the new backend to the balancer's map
-	backends[service.ID] = &WeightedBackend{
-		ID:      service.ID,
-		JobID:   service.JobID,
-		AllocID: service.AllocID,
-
-		Weight:   weight,
-		Upstream: UpstreamService(service),
-	}
-
-	for id, backend := range balancer.Backends {
-		backends[id] = backend
-		// Rehash the backend's relative weight
+	// Rehash the backend services by their relative weights
+	for _, backend := range balancer.Upstreams {
 		for i := uint64(0); i < backend.Weight; i++ {
 			weighted = append(weighted, backend)
 		}
 	}
 
-	balancer.Backends = backends
 	balancer.weighted = weighted
+	logging.Info(ctx, "balancer.rehash", zap.Int("count", len(balancer.Upstreams)), zap.Uint64("weight", balancer.Total))
+}
+
+// Add inserts a backend and rehashes the balancer's internal weighting
+func (balancer WeightedRandom) Add(ctx context.Context, service *api.ServiceRegistration) Handler {
+	if _, has := balancer.Upstreams[service.ID]; has {
+		// NOP if the service is already included in the balancer
+		return balancer
+	}
+
+	weight, _ := WeightTag(service.Tags)
+
+	_, logger := logging.Logger(ctx)
+	logger.Info("upstream.add", zap.String("addr", service.Address), zap.Int("port", service.Port))
+
+	// Rebuild the balancer's map and distribution slice
+	backends := make(map[string]*WeightedUpstream, len(balancer.Upstreams)+1)
+
+	// Add the new backend to the balancer's map
+	backends[service.ID] = &WeightedUpstream{
+		ID:      service.ID,
+		JobID:   service.JobID,
+		AllocID: service.AllocID,
+
+		Weight:   weight,
+		Endpoint: UpstreamService(service),
+	}
+
+	balancer.Total = weight
+
+	for id, backend := range balancer.Upstreams {
+		backends[id] = backend
+		balancer.Total += backend.Weight
+	}
+
+	balancer.Upstreams = backends
+	balancer.Rehash(ctx)
 
 	return balancer
 }
 
 // Del removes a backend and rehashes the balancer's internal weighting
-func (balancer WeightedRandom) Del(service *api.ServiceRegistration) Handler {
+func (balancer WeightedRandom) Del(ctx context.Context, service *api.ServiceRegistration) Handler {
+	if _, has := balancer.Upstreams[service.ID]; !has {
+		// NOP if the service isn't in the balancer
+		return balancer
+	}
+
 	weight, _ := WeightTag(service.Tags)
-	balancer.Total -= weight
+
+	_, logger := logging.Logger(ctx)
+	logger.Info("upstream.del", zap.String("addr", service.Address), zap.Int("port", service.Port), zap.Uint64("weight", weight))
 
 	// Rebuild the balancer's map and distribution slice
-	backends := make(map[string]*WeightedBackend, len(balancer.Backends)-1)
-	weighted := make([]*WeightedBackend, 0, balancer.Total)
+	backends := make(map[string]*WeightedUpstream, len(balancer.Upstreams)-1)
+	balancer.Total = 0
 
-	for id, backend := range balancer.Backends {
+	for id, backend := range balancer.Upstreams {
 		if id == service.ID {
 			// Remove the requested backend
 			continue
 		}
 
 		backends[id] = backend
-		// Rehash the backend's relative weight
-		for i := uint64(0); i < backend.Weight; i++ {
-			weighted = append(weighted, backend)
-		}
+		balancer.Total += backend.Weight
 	}
 
-	balancer.Backends = backends
-	balancer.weighted = weighted
+	if len(backends) == 0 {
+		return empty{}
+	}
 
+	balancer.Upstreams = backends
+
+	balancer.Rehash(ctx)
 	return balancer
 }
 
@@ -163,11 +210,11 @@ func (empty) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-func (empty) Add(service *api.ServiceRegistration) Handler {
-	return NewBalancer(service.Tags).Add(service)
+func (empty) Add(ctx context.Context, service *api.ServiceRegistration) Handler {
+	return NewBalancer(service.Tags).Add(ctx, service)
 }
 
-func (empty) Del(*api.ServiceRegistration) {}
+func (e empty) Del(context.Context, *api.ServiceRegistration) Handler { return e }
 
 func (empty) Empty() bool {
 	return true
